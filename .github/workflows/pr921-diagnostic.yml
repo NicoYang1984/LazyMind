@@ -1,0 +1,110 @@
+name: PR921 isolated diagnostics
+on:
+  push:
+    branches: [codex/pr921-ci-diagnostics]
+permissions:
+  contents: read
+jobs:
+  postgres-red:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U root -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DB_DRIVER: postgres
+      TEST_DB_DSN: postgres://root:test-password@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.11'
+          cache-dependency-path: backend/core/go.sum
+      - name: Instrument field differences without changing assertions
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/source-head.txt
+          python3 .ci-diagnostics/instrument.py . pg
+          gofmt -w backend/core/workflow/external_agent_recovery*test.go
+          PGPASSWORD=test-password psql -h 127.0.0.1 -U root -d postgres -c 'select version();' > evidence/postgres-version.txt
+      - name: Reproduce each original failure on PostgreSQL
+        shell: bash
+        run: |
+          set +e
+          for test in TestExternalTaskCollectsRecoveredSessionWithoutExecuting TestExternalTaskRecoveryRollsBackWhenResultProjectionFails TestExternalTaskRecoveryRequiresCompletedProjection; do
+            echo "go test ./workflow -run ^${test}$ -count=1 -v" > "evidence/$test.command"
+            (cd backend/core && go test ./workflow -run "^${test}$" -count=1 -v) > "evidence/$test.log" 2>&1
+            result=$?
+            echo "$result" > "evidence/$test.exit"
+            cat "evidence/$test.log"
+          done
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: postgres-red-evidence
+          path: evidence/
+  windows-compare:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: main
+            ref: 5fd90e1d7e86e0fc0f0c4aec1f94f7f59f47d79b
+          - label: pr-head
+            ref: 09003eb066ef2f2dea604b3f7c9cf72b12af9bdd
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: diagnostics
+      - uses: actions/checkout@v4
+        with:
+          repository: NicoYang1984/LazyMind
+          ref: ${{ matrix.ref }}
+          path: subject
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.11'
+          cache-dependency-path: subject/local/lazymind-cli/go.sum
+      - name: Original isolated test, three repetitions
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force evidence
+          git -C subject rev-parse HEAD | Out-File evidence/source-head.txt
+          Set-Location subject/local/lazymind-cli
+          go test ./internal/agentexec -run '^TestWindowsPackageQueryHasNoConsole$' -count=3 -v 2>&1 | Tee-Object ../../../evidence/original.log
+          $code = $LASTEXITCODE
+          $code | Out-File ../../../evidence/original.exit
+          exit $code
+      - name: Instrument elapsed time, deadline and stderr, preserving assertions
+        if: always()
+        shell: pwsh
+        run: |
+          python diagnostics/.ci-diagnostics/instrument.py subject win
+          gofmt -w subject/local/lazymind-cli/internal/agentexec/desktop_query_windows_test.go
+      - name: Instrumented test, three repetitions
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Set-Location subject/local/lazymind-cli
+          go test ./internal/agentexec -run '^TestWindowsPackageQueryHasNoConsole$' -count=3 -v 2>&1 | Tee-Object ../../../evidence/instrumented.log
+          $code = $LASTEXITCODE
+          $code | Out-File ../../../evidence/instrumented.exit
+          exit $code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-${{ matrix.label }}-evidence
+          path: evidence/
