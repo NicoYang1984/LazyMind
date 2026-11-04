@@ -5,9 +5,9 @@ on:
 permissions:
   contents: read
 jobs:
-  postgres-red:
+  postgres-green:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -28,33 +28,48 @@ jobs:
         with:
           go-version: '1.25.11'
           cache-dependency-path: backend/core/go.sum
-      - name: Instrument field differences without changing assertions
+      - name: Record exact tested source and PostgreSQL version
         run: |
           mkdir -p evidence
           git rev-parse HEAD > evidence/source-head.txt
-          python3 .ci-diagnostics/instrument.py . pg
-          gofmt -w backend/core/workflow/external_agent_recovery*test.go
+          sha256sum backend/core/workflow/external_agent_recovery_test.go > evidence/test-source.sha256
           PGPASSWORD=test-password psql -h 127.0.0.1 -U root -d postgres -c 'select version();' > evidence/postgres-version.txt
-      - name: Reproduce each original failure on PostgreSQL
+      - name: Verify each fixed test on PostgreSQL
         shell: bash
         run: |
           set +e
+          overall=0
           for test in TestExternalTaskCollectsRecoveredSessionWithoutExecuting TestExternalTaskRecoveryRollsBackWhenResultProjectionFails TestExternalTaskRecoveryRequiresCompletedProjection; do
             echo "go test ./workflow -run ^${test}$ -count=1 -v" > "evidence/$test.command"
             (cd backend/core && go test ./workflow -run "^${test}$" -count=1 -v) > "evidence/$test.log" 2>&1
             result=$?
             echo "$result" > "evidence/$test.exit"
             cat "evidence/$test.log"
+            if [ "$result" -ne 0 ]; then overall=1; fi
           done
-          exit 0
+          exit "$overall"
+      - name: Full Workflow PostgreSQL regression and vet
+        shell: bash
+        run: |
+          set +e
+          echo 'go test ./workflow/... -count=1 -timeout=10m -json' > evidence/full-workflow.command
+          (cd backend/core && go test ./workflow/... -count=1 -timeout=10m -json) > evidence/full-workflow.log 2>&1
+          result=$?
+          echo "$result" > evidence/full-workflow.exit
+          tail -20 evidence/full-workflow.log
+          if [ "$result" -ne 0 ]; then exit "$result"; fi
+          (cd backend/core && go vet ./workflow/...) > evidence/vet.log 2>&1
+          result=$?
+          echo "$result" > evidence/vet.exit
+          exit "$result"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: postgres-red-evidence
+          name: postgres-green-evidence
           path: evidence/
-  windows-compare:
+  windows-full-cold:
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -76,35 +91,26 @@ jobs:
         with:
           go-version: '1.25.11'
           cache-dependency-path: subject/local/lazymind-cli/go.sum
-      - name: Original isolated test, three repetitions
-        continue-on-error: true
+      - name: Add diagnostics before first PowerShell probe on this runner
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force evidence
           git -C subject rev-parse HEAD | Out-File evidence/source-head.txt
-          Set-Location subject/local/lazymind-cli
-          go test ./internal/agentexec -run '^TestWindowsPackageQueryHasNoConsole$' -count=3 -v 2>&1 | Tee-Object ../../../evidence/original.log
-          $code = $LASTEXITCODE
-          $code | Out-File ../../../evidence/original.exit
-          exit $code
-      - name: Instrument elapsed time, deadline and stderr, preserving assertions
-        if: always()
-        shell: pwsh
-        run: |
           python diagnostics/.ci-diagnostics/instrument.py subject win
           gofmt -w subject/local/lazymind-cli/internal/agentexec/desktop_query_windows_test.go
-      - name: Instrumented test, three repetitions
-        if: always()
-        continue-on-error: true
+      - name: Same full module command as CI, with elapsed/deadline/stderr output
         shell: pwsh
+        env:
+          GODEBUG: gocachetest=1
         run: |
+          $diagnostics = (Resolve-Path evidence).Path
           Set-Location subject/local/lazymind-cli
-          go test ./internal/agentexec -run '^TestWindowsPackageQueryHasNoConsole$' -count=3 -v 2>&1 | Tee-Object ../../../evidence/instrumented.log
+          go test ./... -count=1 -json "-debug-actiongraph=$diagnostics/actions.json" 2> "$diagnostics/cache.log" | Tee-Object "$diagnostics/tests.jsonl"
           $code = $LASTEXITCODE
-          $code | Out-File ../../../evidence/instrumented.exit
+          $code | Out-File "$diagnostics/test.exit"
           exit $code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-${{ matrix.label }}-evidence
+          name: windows-full-${{ matrix.label }}-evidence
           path: evidence/
